@@ -225,6 +225,8 @@ pub enum TrustFlowError {
     RevealPhaseNotEnded = 21,
     /// Returned when a sensitive contract entrypoint is called while the contract is paused.
     ContractPaused = 22,
+    /// `release_milestone_tranche` called before the milestone's time-lock has expired.
+    MilestoneTimeLocked = 23,
 }
 
 // ---------------------------------------------------------------------------
@@ -434,6 +436,7 @@ pub struct Milestone {
     pub label: String,
     pub amount: i128,
     pub approved: bool,
+    pub release_time: u32,
 }
 
 #[contracttype]
@@ -914,6 +917,12 @@ impl TrustFlow {
             .milestones
             .get(milestone_index)
             .ok_or(TrustFlowError::MilestoneNotFound)?;
+
+        // Time-lock check: milestone cannot be claimed before its release_time
+        let current_ledger = env.ledger().sequence();
+        if current_ledger < milestone.release_time {
+            return Err(TrustFlowError::MilestoneTimeLocked);
+        }
 
         let milestone_key = DataKey::MilestoneReleased(MilestoneKey {
             escrow_id,
@@ -1545,7 +1554,7 @@ mod tests {
         let depositor = Address::random(env);
         let beneficiary = Address::random(env);
 
-        mint(sac, &depositor, 1_000);
+        mint(&sac, &depositor, 1_000);
         let escrow_id = client.create_escrow(&depositor, &beneficiary, &1_000);
 
         client.raise_dispute(
@@ -2241,11 +2250,13 @@ mod tests {
                     label: String::from_slice(&env, "Design"),
                     amount: 400,
                     approved: false,
+                    release_time: 0,
                 },
                 Milestone {
                     label: String::from_slice(&env, "Development"),
                     amount: 600,
                     approved: false,
+                    release_time: 0,
                 },
             ],
         );
@@ -2547,6 +2558,7 @@ mod tests {
                 label: String::from_slice(env, "Milestone 1"),
                 amount: milestone_amount,
                 approved: false,
+                release_time: 0, // No time-lock for backward compatibility
             }],
         );
         let escrow_id = client.init_escrow(&depositor, &beneficiary, &milestones);
@@ -2693,11 +2705,13 @@ mod tests {
                     label: String::from_slice(&env, "M1"),
                     amount: 400,
                     approved: false,
+                    release_time: 0,
                 },
                 Milestone {
                     label: String::from_slice(&env, "M2"),
                     amount: 600,
                     approved: false,
+                    release_time: 0,
                 },
             ],
         );
@@ -2812,6 +2826,190 @@ mod tests {
 
         let result = client.try_release_milestone_tranche(&escrow_id, &0u32, &1, &depositor);
         assert_eq!(result, Err(Ok(TrustFlowError::InvalidState)));
+    }
+
+    #[test]
+    fn test_milestone_time_locked_rejects_early_release() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _token_addr, sac) = setup(&env, DEFAULT_SLASH_BPS);
+        let depositor = Address::random(&env);
+        let beneficiary = Address::random(&env);
+        mint(&sac, &depositor, 1_000);
+
+        // Set release_time to future ledger (current + 100)
+        let current_ledger = env.ledger().sequence();
+        let future_ledger = current_ledger + 100;
+
+        let milestones = Vec::from_array(
+            &env,
+            [Milestone {
+                label: String::from_slice(&env, "Milestone 1"),
+                amount: 1_000,
+                approved: false,
+                release_time: future_ledger,
+            }],
+        );
+        let escrow_id = client.init_escrow(&depositor, &beneficiary, &milestones);
+
+        // Attempt to release before time-lock expires should fail
+        let result = client.try_release_milestone_tranche(&escrow_id, &0u32, &1_000, &depositor);
+        assert_eq!(result, Err(Ok(TrustFlowError::MilestoneTimeLocked)));
+    }
+
+    #[test]
+    fn test_milestone_time_locked_allows_release_after_deadline() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, token_addr, sac) = setup(&env, DEFAULT_SLASH_BPS);
+        let depositor = Address::random(&env);
+        let beneficiary = Address::random(&env);
+        mint(&sac, &depositor, 1_000);
+
+        // Set release_time to future ledger (current + 10)
+        let current_ledger = env.ledger().sequence();
+        let release_ledger = current_ledger + 10;
+
+        let milestones = Vec::from_array(
+            &env,
+            [Milestone {
+                label: String::from_slice(&env, "Milestone 1"),
+                amount: 1_000,
+                approved: false,
+                release_time: release_ledger,
+            }],
+        );
+        let escrow_id = client.init_escrow(&depositor, &beneficiary, &milestones);
+
+        // Attempt to release before time-lock expires should fail
+        let result = client.try_release_milestone_tranche(&escrow_id, &0u32, &1_000, &depositor);
+        assert_eq!(result, Err(Ok(TrustFlowError::MilestoneTimeLocked)));
+
+        // Advance ledger past release_time
+        advance_ledger(&env, 10);
+
+        // Release should now succeed
+        client.release_milestone_tranche(&escrow_id, &0u32, &1_000, &depositor);
+
+        // Verify funds were transferred
+        assert_eq!(balance(&env, &token_addr, &beneficiary), 995); // 1000 - 5 (50bps fee)
+    }
+
+    #[test]
+    fn test_milestone_time_locked_partial_release() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, token_addr, sac) = setup(&env, DEFAULT_SLASH_BPS);
+        let depositor = Address::random(&env);
+        let beneficiary = Address::random(&env);
+        mint(&sac, &depositor, 1_000);
+
+        // Set release_time to future ledger (current + 10)
+        let current_ledger = env.ledger().sequence();
+        let release_ledger = current_ledger + 10;
+
+        let milestones = Vec::from_array(
+            &env,
+            [Milestone {
+                label: String::from_slice(&env, "Milestone 1"),
+                amount: 1_000,
+                approved: false,
+                release_time: release_ledger,
+            }],
+        );
+        let escrow_id = client.init_escrow(&depositor, &beneficiary, &milestones);
+
+        // Partial release before time-lock should fail
+        let result = client.try_release_milestone_tranche(&escrow_id, &0u32, &500, &depositor);
+        assert_eq!(result, Err(Ok(TrustFlowError::MilestoneTimeLocked)));
+
+        // Advance ledger past release_time
+        advance_ledger(&env, 10);
+
+        // Partial release should now succeed
+        client.release_milestone_tranche(&escrow_id, &0u32, &500, &depositor);
+        assert_eq!(balance(&env, &token_addr, &beneficiary), 498); // 500 - 2 (50bps fee rounded)
+
+        // Second partial release should also succeed
+        client.release_milestone_tranche(&escrow_id, &0u32, &500, &depositor);
+        assert_eq!(balance(&env, &token_addr, &beneficiary), 995); // 1000 - 5 total
+    }
+
+    #[test]
+    fn test_multiple_milestones_different_time_locks() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, token_addr, sac) = setup(&env, DEFAULT_SLASH_BPS);
+        let depositor = Address::random(&env);
+        let beneficiary = Address::random(&env);
+        mint(&sac, &depositor, 1_000);
+
+        let current_ledger = env.ledger().sequence();
+
+        let milestones = Vec::from_array(
+            &env,
+            [
+                Milestone {
+                    label: String::from_slice(&env, "M1"),
+                    amount: 400,
+                    approved: false,
+                    release_time: current_ledger, // Immediately available
+                },
+                Milestone {
+                    label: String::from_slice(&env, "M2"),
+                    amount: 600,
+                    approved: false,
+                    release_time: current_ledger + 20, // Locked for 20 ledgers
+                },
+            ],
+        );
+        let escrow_id = client.init_escrow(&depositor, &beneficiary, &milestones);
+
+        // M1 should be immediately releasable
+        client.release_milestone_tranche(&escrow_id, &0u32, &400, &depositor);
+        assert_eq!(balance(&env, &token_addr, &beneficiary), 398); // 400 - 2 (50bps fee rounded)
+
+        // M2 should be time-locked
+        let result = client.try_release_milestone_tranche(&escrow_id, &1u32, &600, &depositor);
+        assert_eq!(result, Err(Ok(TrustFlowError::MilestoneTimeLocked)));
+
+        // Advance ledger past M2's release_time
+        advance_ledger(&env, 20);
+
+        // M2 should now be releasable
+        client.release_milestone_tranche(&escrow_id, &1u32, &600, &depositor);
+        assert_eq!(balance(&env, &token_addr, &beneficiary), 995); // 1000 - 5 total
+    }
+
+    #[test]
+    fn test_milestone_no_time_lock_immediate_release() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, token_addr, sac) = setup(&env, DEFAULT_SLASH_BPS);
+        let depositor = Address::random(&env);
+        let beneficiary = Address::random(&env);
+        mint(&sac, &depositor, 1_000);
+
+        // Set release_time to 0 (no time-lock)
+        let milestones = Vec::from_array(
+            &env,
+            [Milestone {
+                label: String::from_slice(&env, "Milestone 1"),
+                amount: 1_000,
+                approved: false,
+                release_time: 0,
+            }],
+        );
+        let escrow_id = client.init_escrow(&depositor, &beneficiary, &milestones);
+
+        // Should be immediately releasable
+        client.release_milestone_tranche(&escrow_id, &0u32, &1_000, &depositor);
+        assert_eq!(balance(&env, &token_addr, &beneficiary), 995); // 1000 - 5 (50bps fee)
     }
 
     #[test]
@@ -3300,6 +3498,7 @@ mod tests {
                 label: String::from_slice(&env, "M1"),
                 amount: 50_000,
                 approved: false,
+                release_time: 0,
             }
         ];
         assert_eq!(
@@ -3406,6 +3605,7 @@ mod tests {
                 label: String::from_slice(&env, "M1"),
                 amount: 50_000,
                 approved: false,
+                release_time: 0,
             }
         ];
         let escrow_id = client.init_escrow(&depositor, &beneficiary, &milestones);
