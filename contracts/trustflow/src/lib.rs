@@ -326,6 +326,36 @@ pub struct VoteRevealed {
     pub vote_for_depositor: bool,
 }
 
+/// Emitted by [`TrustFlow::stake`] when a juror adds stake.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct Staked {
+    pub juror: Address,
+    pub amount: i128,
+    pub new_total: i128,
+}
+
+/// Emitted by [`TrustFlow::unstake`] when a juror withdraws stake.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct Unstaked {
+    pub juror: Address,
+    pub amount: i128,
+    pub remaining: i128,
+}
+
+/// Emitted by [`TrustFlow::resolve_dispute`] when a juror on the losing side
+/// is slashed.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct JurorSlashed {
+    pub escrow_id: u64,
+    pub juror: Address,
+    pub slash_amount: i128,
+    pub remaining_stake: i128,
+    pub slash_count: u32,
+}
+
 // ---------------------------------------------------------------------------
 // Storage types
 // ---------------------------------------------------------------------------
@@ -686,8 +716,21 @@ impl TrustFlow {
 
         let key = DataKey::JurorStake(juror.clone());
         let prev: i128 = env.storage().persistent().get(&key).unwrap_or(0);
-        env.storage().persistent().set(&key, &(prev + amount));
+        let new_total = prev
+            .checked_add(amount)
+            .ok_or(TrustFlowError::ArithmeticOverflow)?;
+        env.storage().persistent().set(&key, &new_total);
         extend_persistent_ttl(&env, &key);
+
+        env.events().publish(
+            (symbol_short!("stake"), symbol_short!("staked")),
+            Staked {
+                juror,
+                amount,
+                new_total,
+            },
+        );
+
         Ok(())
     }
 
@@ -703,8 +746,21 @@ impl TrustFlow {
         }
         let token: Address = env.storage().instance().get(&DataKey::Token).unwrap();
         token::Client::new(&env, &token).transfer(&env.current_contract_address(), &juror, &amount);
-        env.storage().persistent().set(&key, &(current - amount));
+        let remaining = current
+            .checked_sub(amount)
+            .ok_or(TrustFlowError::ArithmeticOverflow)?;
+        env.storage().persistent().set(&key, &remaining);
         extend_persistent_ttl(&env, &key);
+
+        env.events().publish(
+            (symbol_short!("stake"), symbol_short!("unstaked")),
+            Unstaked {
+                juror,
+                amount,
+                remaining,
+            },
+        );
+
         Ok(())
     }
 
@@ -786,7 +842,9 @@ impl TrustFlow {
             .instance()
             .get(&DataKey::EscrowCounter)
             .unwrap_or(0);
-        let id = counter + 1;
+        let id = counter
+            .checked_add(1)
+            .ok_or(TrustFlowError::ArithmeticOverflow)?;
         env.storage().instance().set(&DataKey::EscrowCounter, &id);
 
         let escrow_key = DataKey::Escrow(id);
@@ -822,7 +880,9 @@ impl TrustFlow {
             if m.amount <= 0 {
                 return Err(TrustFlowError::InvalidAmount);
             }
-            total_amount += m.amount;
+            total_amount = total_amount
+                .checked_add(m.amount)
+                .ok_or(TrustFlowError::ArithmeticOverflow)?;
         }
 
         if total_amount <= 0 {
@@ -841,7 +901,9 @@ impl TrustFlow {
             .instance()
             .get(&DataKey::EscrowCounter)
             .unwrap_or(0);
-        let id = counter + 1;
+        let id = counter
+            .checked_add(1)
+            .ok_or(TrustFlowError::ArithmeticOverflow)?;
         env.storage().instance().set(&DataKey::EscrowCounter, &id);
 
         let escrow_key = DataKey::Escrow(id);
@@ -1269,9 +1331,13 @@ impl TrustFlow {
                 }))
                 .unwrap_or(false);
             if vote {
-                for_depositor += 1;
+                for_depositor = for_depositor
+                    .checked_add(1)
+                    .ok_or(TrustFlowError::ArithmeticOverflow)?;
             } else {
-                for_beneficiary += 1;
+                for_beneficiary = for_beneficiary
+                    .checked_add(1)
+                    .ok_or(TrustFlowError::ArithmeticOverflow)?;
             }
         }
 
@@ -1298,14 +1364,43 @@ impl TrustFlow {
             if vote != ruling {
                 let stake_key = DataKey::JurorStake(voter.clone());
                 let stake: i128 = env.storage().persistent().get(&stake_key).unwrap_or(0);
-                // slash_amount = stake * slash_bps / 10_000, saturating at stake
-                let slash = stake
-                    .checked_mul(slash_bps as i128)
-                    .unwrap_or(stake * DEFAULT_SLASH_BPS as i128)
-                    .checked_div(10_000)
-                    .unwrap_or(0)
-                    .min(stake);
-                env.storage().persistent().set(&stake_key, &(stake - slash));
+                // slash_amount = stake * slash_bps / 10_000, capped at stake.
+                //
+                // Three-tier safe arithmetic:
+                //   1. Try i128 checked_mul (fast path, covers typical values).
+                //   2. Widen to u128 for stakes up to ~3.4e35 with bps up to
+                //      ~10_000 (covers virtually all realistic values).
+                //   3. If even u128 overflows, divide first then multiply —
+                //      this truncates early but guarantees no overflow for any
+                //      stake/bps combination that fits in i128.
+                let slash: i128 = {
+                    let stake_u128 = stake as u128;
+                    let bps_u128 = slash_bps as u128;
+                    let slash_u128 = stake
+                        .checked_mul(slash_bps as i128)
+                        .and_then(|v| v.checked_div(10_000))
+                        .map(|v| v as u128)
+                        .or_else(|| {
+                            // i128 overflow — try u128
+                            stake_u128
+                                .checked_mul(bps_u128)
+                                .and_then(|v| v.checked_div(10_000))
+                                .or_else(|| {
+                                    // u128 overflow too — divide first
+                                    stake_u128
+                                        .checked_div(10_000)
+                                        .map(|q| q.saturating_mul(bps_u128))
+                                })
+                        })
+                        .unwrap_or(stake_u128)
+                        .min(stake_u128);
+                    slash_u128 as i128
+                };
+
+                let remaining_stake = stake
+                    .checked_sub(slash)
+                    .ok_or(TrustFlowError::ArithmeticOverflow)?;
+                env.storage().persistent().set(&stake_key, &remaining_stake);
                 extend_persistent_ttl(&env, &stake_key);
 
                 let slash_count_key = DataKey::JurorSlashCount(voter.clone());
@@ -1314,10 +1409,22 @@ impl TrustFlow {
                     .persistent()
                     .get(&slash_count_key)
                     .unwrap_or(0);
-                env.storage()
-                    .persistent()
-                    .set(&slash_count_key, &(count + 1));
+                let new_count = count
+                    .checked_add(1)
+                    .ok_or(TrustFlowError::ArithmeticOverflow)?;
+                env.storage().persistent().set(&slash_count_key, &new_count);
                 extend_persistent_ttl(&env, &slash_count_key);
+
+                env.events().publish(
+                    (symbol_short!("slash"), symbol_short!("slashed")),
+                    JurorSlashed {
+                        escrow_id,
+                        juror: voter,
+                        slash_amount: slash,
+                        remaining_stake,
+                        slash_count: new_count,
+                    },
+                );
             }
         }
 
@@ -2042,7 +2149,7 @@ mod tests {
         // remaining stake approximates 10_000 * 0.9^3 = 7_290.
         // Due to integer truncation the result is >= 7_290 and < 7_300.
         assert!(
-            stake_r3 >= 7_290 && stake_r3 <= 7_300,
+            (7_290..=7_300).contains(&stake_r3),
             "expected ~7290 after 3×10% slashes, got {stake_r3}"
         );
     }
